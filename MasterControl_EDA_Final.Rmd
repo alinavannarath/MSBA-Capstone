@@ -1,0 +1,317 @@
+---
+title: "MasterControl EDA"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Introduction
+
+MasterControl's Manufacturing Solutions product (Mx) is significantly underperforming its Quality Solutions product (Qx). The company believes it may not be targeting the right companies or the right people within those companies, leading to missed revenue opportunities and wasted marketing expenditures.
+
+Conversion predictions will be generated using a classification model. The model will use historical sale leads and data collected from MasterControl. Then we will analyze patterns produced by the models to identify similarities between higher-converting accounts. 
+
+The purpose of this EDA notebook is to explore the relationships between different variables in the data. We will explore questions like what are the common characteristics of contacts/companies that are best prospects for Mx and how they differ from Qx products.
+
+# Description of the data
+
+```{r explore the data}
+
+# Import packages
+suppressMessages(suppressWarnings({
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+  }))
+
+# Import csv file
+master <- read.csv("Mastercontrol QAL Performance.csv")
+
+# Quick look at the data
+master |>
+  str()
+
+master |>
+  summary()
+
+# Checking the proportion of each target variable value
+prop.table(table(master$next_stage__c))
+
+```
+
+There are 16,815 observations with 14 variables that are all characters. If we add all of the observations that have progressed (SQL, SQO, and Won) then that makes up about 17.7% of the data. 
+
+Right now, qal.cohort.date is stored as characters, we will have to convert this to a date format.
+
+```{r convert qualification date format}
+
+master$qal.cohort.date <- ymd(master$qal.cohort.date)
+  
+```
+
+# Discussion of missing data
+
+```{r filtering to missing data}
+
+# Checking for blanks in each column
+NA_col <- colSums(master == "", na.rm = TRUE)
+
+# Check total blanks across all data
+NA_total <- sum(master == "", na.rm = TRUE)
+
+NA_col
+NA_total
+
+```
+
+There are 8 variables that have blank values, and a total of 5,640 cells that were left blank.
+
+### Converting blanks to NA
+
+We have identified the blanks so now we can convert them to NA.
+
+```{r convert blanks to NA}
+
+master_clean <- master |>
+  mutate(across(where(is.character), ~ na_if(., "")))
+
+# Check for blanks again
+colSums(master_clean == "", na.rm = TRUE)
+
+# Calculating the percent of NAs in each column
+master_clean |>
+  summarise(across(everything(),
+                   ~ round(mean(is.na(.)) * 100, 2)))
+
+```
+
+acct.primary.site.function, acct.manufacturing.model, acct.target.industry, contact.lead.id, next_stage__c, acct.territory.rollup, and acct.tier.rollup all have less than 3% NAs. We can delete these since they make up such a miniscule amount.
+
+```{r deleting rows with very few NAs}
+
+master_clean <- master_clean |>
+  filter(!is.na(acct.primary.site.function),
+         !is.na(acct.manufacturing.model),
+         !is.na(acct.target.industry),
+         !is.na(contact.lead.id),
+         !is.na(next_stage__c),
+         !is.na(acct.territory.rollup),
+         !is.na(acct.tier.rollup))
+
+# Checking to see if NAs were dropped in those columns
+master_clean |>
+  summarise(across(everything(),
+                   ~ round(mean(is.na(.)) * 100, 2)))
+
+```
+
+contact.lead.title has 28.88% of its data NAs. Since this is such a large amount, we will keep these rows because they could still hold valuable information. There are no numeric values in the dataset so we can convert NA to "Missing" instead for categorical analysis.
+
+```{r converting NA to Missing}
+
+master_clean <- master_clean |>
+  mutate(across(where(~ is.character(.)), 
+                ~ ifelse(is.na(.), "Missing", as.character(.))))
+
+# Checking NAs
+master_clean |>
+  summarise(across(everything(),
+                   ~ round(mean(is.na(.)) * 100, 2)))
+
+```
+Now there are no NAs in the dataset. They have been replaced by "Missing" instead and we will treat them as its own category.
+
+### Grouping unique values to larger categories
+
+Another important thing about this dataset is that there are many unique values for each column. This creates high cardinality and can make it hard for us to model our data. We will group these categories into larger groups to make them more meaningful.
+
+```{r grouping categories}
+
+# Grouping SQL, SQO, and Won as Success and the rest as Failure
+master_clean <- master_clean |>
+  mutate(success_binary = ifelse(
+    next_stage__c %in% c("SQL", "SQO", "Won"),
+    1,
+    0
+  ))
+
+# Checking class balance
+prop.table(table(master_clean$success_binary))
+
+# Converting all contact lead titles to uppercase for standardization
+master_clean <- master_clean |>
+  mutate(contact.lead.title = str_trim(contact.lead.title),
+         contact.lead.title = str_to_upper(contact.lead.title))
+
+# Grouping contact lead titles to more general categories
+master_clean <- master_clean |>
+  mutate(title_group = case_when(
+    str_detect(contact.lead.title, "CHIEF|CEO|CFO|CTO|COO|CIO|PRESIDENT|OWNER|FOUNDER|EXECUTIVE|DIR") ~ "Executive",
+    str_detect(contact.lead.title, "VP|VICE PRESIDENT|HEAD") ~ "VP / Head",
+    str_detect(contact.lead.title, "DIRECTOR") ~ "Director",
+    str_detect(contact.lead.title, "MANAGER|SUPERVISOR|MANAGE|MANGER") ~ "Manager",
+    str_detect(contact.lead.title, "ENGINEER|SCIENTIST|TECHNICAL|DEVELOPER|LEAD|TECHNICIAN|ARCHITECT") ~ "Technical",
+    str_detect(contact.lead.title, "ANALYST") ~ "Analyst",
+    str_detect(contact.lead.title, "SPECIALIST|ASSOCIATE|COORDINATOR") ~ "Specialist",
+    str_detect(contact.lead.title, "CONSULTANT|CONSULTING") ~ "Consultant",
+    str_detect(contact.lead.title, "MISSING") ~ "Unknown",
+    str_detect(contact.lead.title, "PROFESSOR|RESEARCHER|RESEARCH|LECTURER|TEACHER|PROF") ~ "Academia",
+    str_detect(contact.lead.title, "SALES") ~ "Sales",
+    TRUE ~ "Other"
+  ))
+
+# Checking title group distribution
+prop.table(table(master_clean$title_group))
+
+# Converting all primary site functions to uppercase for standardization
+master_clean <- master_clean |>
+  mutate(acct.primary.site.function = str_trim(acct.primary.site.function),
+         acct.primary.site.function = str_to_upper(acct.primary.site.function))
+
+# Grouping acct primary site function
+master_clean <- master_clean |>
+  mutate(site_function = case_when(
+    str_detect(acct.primary.site.function, "OSD|STERILE INJECTABLES|API|BIOLOGICS|CELL THERAPIES") ~ "Active Pharma Manufacturing",
+    str_detect(acct.primary.site.function, "IMPLANTABLE DEVICES|IVD|INSTRUMENTS|PHARMA|HEALTH|MEDICAL|SURGICAL|PATIENT|DRUG|CARE|DIAGNOSTIC|BLOOD|VACCINE") ~ "Medical Device Manufacturing",
+    str_detect(acct.primary.site.function, "SERVICES|CONSULTING|NON-MANUFACTURING") ~ "Non-Manufacturing",
+    str_detect(acct.primary.site.function, "FOOD|BEVERAGE|NUTRACEUTICAL|COSMETICS|CHEMICALS") ~ "Other Manufacturing",
+    str_detect(acct.primary.site.function, "NOT ENOUGH INFO FOUND|MISSING") ~ "Unknown",
+    TRUE ~ "Other"
+  ))
+
+prop.table(table(master_clean$site_function))
+
+```
+
+# Exploratory visualizations and /or summary tables
+
+```{r target variable class balance}
+
+table(master_clean$success_binary)
+prop.table(table(master_clean$success_binary))
+
+# Distinction between Mx and Qx successes
+master_clean |>
+  group_by(solution_rollup) |>
+  summarise(
+    total = n(),
+    successes = sum(success_binary),
+    success_rate = mean(success_binary)
+  )
+
+```
+
+There are 2,968 recorded successes and 13,092 failures. Earlier we calculated that 17.7% of the dataset were successes but after cleaning the data, that has increased to 18.5%.
+
+Within Mx solutions alone, we have a success rate of 12.9% while Qx has 20.3%, which is expected.
+
+```{r distribution of title groups by success}
+
+master_clean |>
+  ggplot(aes(x = title_group, fill = factor(success_binary))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  facet_wrap(~ solution_rollup) +
+  labs(fill = "Success",
+       x = "Title Group",
+       y = "Proportion",
+       title = "Success Rate by Title Group")
+
+```
+
+A lot of the contact lead titles were left blank so there are many Unknowns that make up a lot of the data. If we ignore that category though, we see that many of the successes are from Manager/Executive roles. The next best category are Technical roles.
+
+```{r fig.width=20, fig.height=8}
+
+master_clean |>
+  group_by(site_function, solution_rollup) |>
+  summarise(success_rate = mean(success_binary, na.rm = TRUE)) |>
+  ggplot(aes(x = site_function, y = success_rate, fill = solution_rollup)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(success_rate, accuracy = 1)), hjust = -0.2) +
+  coord_flip() +
+  facet_wrap(~ solution_rollup) +
+  labs(
+    x = "Site Function",
+    y = "Success Rate",
+    title = "Success Rate by Site Function"
+  )
+
+```
+
+Much like the lead titles, there are also a lot of data that is missing and make up the majority of failures and successes in the dataset. If we ignore the Unknown category, the next biggest contributors are medical device manufacturing and active pharma site functions.
+
+```{r fig.width=20, fig.height=8}
+
+master_clean |>
+  group_by(acct.target.industry, solution_rollup) |>
+  summarise(success_rate = mean(success_binary, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = acct.target.industry, y = success_rate, fill = solution_rollup)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(success_rate, accuracy = 1)), hjust = -0.2) +
+  coord_flip() +
+  facet_wrap(~ solution_rollup) +
+  labs(
+    x = "Target Industry",
+    y = "Success Rate",
+    title = "Success Rate by Target Industry"
+  )
+
+```
+
+Most successes are seen within the pharma and biotech, non-life science, and medical device industries. 
+
+```{r success rate by month}
+
+# Creating a month variable
+master_clean <- master_clean |>
+  mutate(month = floor_date(qal.cohort.date, "month"))
+
+# Success rate by month filtered to only Mx products
+master_clean |>
+  filter(solution_rollup == "Mx") |>
+  group_by(month) |>
+  summarise(
+    total = n(),
+    success_rate = mean(success_binary)
+  ) |>
+  ggplot(aes(x = month, y = success_rate)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Mx Success Rate by Month",
+       x = "Month",
+       y = "Success Rate") +
+  theme_minimal()
+
+
+```
+
+Mx success rate seem to hover between 15% - 25% between 2024 and 2025. It seems to have performed better in 2024 than it did in 2025, but not by a lot. 
+
+```{r success rate by territory}
+
+master_clean |> 
+  filter(solution_rollup == "Mx") |>
+  ggplot(aes(x = acct.territory.rollup, fill = factor(success_binary))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(title = "Mx Success Rate by Territory",
+       y = "Proportion",
+       fill = "Success") +
+  theme_minimal()
+
+
+```
+
+Mx products predominately show successes in Japan and the Americas, with lower presence in EMEA and APAC/Oceania markets. 
+
+# Results
+
+Our findings show that Mx product successes are most often achieved when the contact lead titles are at the executive or manager level within medical device manufacturing and active pharma site functions. The target industries for these customers are pharma and biotech, non-life science, and medical devices. Mx's success rates are pretty stagnant in 2024 and 2025, with slightly lower performance in 2025. Lastly, the Mx product is most successful in Japan, the Americas, and EMEA territories.
+
+Although our EDA highlights key trends within the data, there is still a substantial portion where there are missing/unknown values. This limits the insights we can draw from this and we will have to take this in consideration as we move forward into the modeling part of our project. 
+

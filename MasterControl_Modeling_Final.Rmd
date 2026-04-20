@@ -1,0 +1,287 @@
+---
+title: "MasterControl Modeling"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+
+# Loading packages and importing data
+suppressMessages(suppressWarnings({
+library(tidyverse)
+library(tidymodels)
+library(caret)
+library(tidyr)
+library(pROC)
+library(ranger)}))
+
+master <- read.csv("master_clean.csv")
+
+# Removing QAL.id and contact.lead.id, and X
+master <- master |>
+  select(-QAL.ID, -contact.lead.id, -X, -qal.cohort.date, -solution)
+
+# Removing redundant variables
+master <- master |>
+  select(-month, -acct.primary.site.function, -contact.lead.title, -next_stage__c)
+
+# Factor success
+master <- master |>
+  mutate(
+    success = factor(success_binary, levels = c(0,1), labels = c("No", "Yes"))
+  )
+
+# Remove success_binary
+master <- master |>
+  select(-success_binary)
+
+# Factoring all variables
+master$acct.manufacturing.model <- as.factor(master$acct.manufacturing.model)
+master$acct.target.industry <- as.factor(master$acct.target.industry)
+master$Priority <- as.factor(master$Priority)
+master$acct.territory.rollup <- as.factor(master$acct.territory.rollup)
+master$acct.tier.rollup <- as.factor(master$acct.tier.rollup)
+master$solution <- as.factor(master$solution)
+master$solution_rollup <- as.factor(master$solution_rollup)
+master$last.tactic.campaign.channel <- as.factor(master$last.tactic.campaign.channel)
+master$title_group <- as.factor(master$title_group)
+master$site_function <- as.factor(master$site_function)
+
+```
+
+```{r}
+
+# Separating only Mx solutions
+df_mx <- master |> 
+  filter(solution_rollup == "Mx") |>
+  filter(site_function != "Non-Manufacturing") |>
+  select(-solution_rollup, -solution)
+
+df_mx |>
+  filter(acct.target.industry == "Medical Device") |>
+  summarise(count = n())
+
+df_mx |>
+  summarise(conversion_rate = mean(success == "Yes"))
+
+```
+
+```{r}
+
+# Stratified splitting
+set.seed(123)
+train_idx <- createDataPartition(df_mx$success, p = 0.70, list = FALSE)
+train_mx  <- df_mx[train_idx, ]
+test_mx   <- df_mx[-train_idx, ]
+
+# Verify class balance was preserved
+cat("Training set:\n")
+print(prop.table(table(train_mx$success)))
+cat("\nTest set:\n")
+print(prop.table(table(test_mx$success)))
+
+# Lumping rare rows
+train_mx <- train_mx |>
+  mutate(
+    acct.manufacturing.model     = fct_lump_min(acct.manufacturing.model,
+                                                min = 30, other_level = "Other"),
+    acct.territory.rollup        = fct_lump_min(acct.territory.rollup,
+                                                min = 30, other_level = "Other"),
+    last.tactic.campaign.channel = fct_lump_min(last.tactic.campaign.channel,
+                                                min = 30, other_level = "Other"),
+    title_group                  = fct_lump_min(title_group,
+                                                min = 30, other_level = "Other"),
+    Priority                     = fct_lump_min(Priority,
+                                                min = 30, other_level = "Other"),
+    acct.target.industry         = fct_lump_min(acct.target.industry,
+                                                min = 30, other_level = "Other")
+  ) |>
+  droplevels()
+
+# Lumping rare rows on test set so it matches train set
+test_mx <- test_mx |>
+  mutate(
+    acct.manufacturing.model     = fct_other(acct.manufacturing.model,
+                                             keep = levels(train_mx$acct.manufacturing.model)),
+    acct.territory.rollup        = fct_other(acct.territory.rollup,
+                                             keep = levels(train_mx$acct.territory.rollup)),
+    last.tactic.campaign.channel = fct_other(last.tactic.campaign.channel,
+                                             keep = levels(train_mx$last.tactic.campaign.channel)),
+    title_group                  = fct_other(title_group,
+                                             keep = levels(train_mx$title_group)),
+    Priority                     = fct_other(Priority,
+                                             keep = levels(train_mx$Priority)),
+     acct.target.industry         = fct_other(acct.target.industry,
+                                             keep = levels(train_mx$acct.target.industry))
+  ) |>
+  mutate(across(where(is.factor),
+                ~ factor(., levels = levels(train_mx[[cur_column()]]))))  |>
+  droplevels()
+
+```
+
+```{r}
+
+# Handling class imbalance
+n_neg        <- sum(train_mx$success == "No")
+n_pos        <- sum(train_mx$success == "Yes")
+weight_ratio <- round(n_neg / n_pos)
+weights_mx   <- ifelse(train_mx$success == "Yes", weight_ratio, 1)
+
+```
+
+```{r}
+
+# Training logistic regression model on Mx dataset
+set.seed(123)
+mx_model <- train(
+  success ~ .,
+  data      = train_mx,
+  method    = "glm",
+  family    = "binomial",
+  weights   = weights_mx,
+  metric    = "ROC",
+  trControl = trainControl(
+    method          = "none",
+    classProbs      = TRUE,
+    summaryFunction = twoClassSummary
+  )
+)
+
+summary(mx_model$finalModel)
+
+```
+
+```{r}
+
+# Running test set
+test_probs <- predict(mx_model, newdata = test_mx, type = "prob")[, "Yes"]
+test_preds_default <- factor(ifelse(test_probs > 0.5, "Yes", "No"),
+                             levels = c("No", "Yes"))
+
+# ROC and AUC
+roc_obj <- roc(test_mx$success, test_probs, levels = c("No", "Yes"))
+cat("Test AUC:", round(auc(roc_obj), 3), "\n")
+
+```
+
+```{r}
+
+#Separating on Qx solution
+df_qx <- master |> 
+  filter(solution_rollup == "Qx") |>
+  select(-solution_rollup, -solution)
+
+```
+
+```{r}
+
+# Stratified split on Qx dataset
+set.seed(123)
+train_idx2 <- createDataPartition(df_qx$success, p = 0.70, list = FALSE)
+train_qx  <- df_qx[train_idx2, ]
+test_qx   <- df_qx[-train_idx2, ]
+
+# Verify class balance was preserved
+cat("Training set:\n")
+print(prop.table(table(train_qx$success)))
+cat("\nTest set:\n")
+print(prop.table(table(test_qx$success)))
+
+# Lumping rare rows
+train_qx <- train_qx |>
+  mutate(
+    acct.manufacturing.model     = fct_lump_min(acct.manufacturing.model,
+                                                min = 30, other_level = "Other"),
+    acct.territory.rollup        = fct_lump_min(acct.territory.rollup,
+                                                min = 30, other_level = "Other"),
+    last.tactic.campaign.channel = fct_lump_min(last.tactic.campaign.channel,
+                                                min = 30, other_level = "Other"),
+    title_group                  = fct_lump_min(title_group,
+                                                min = 30, other_level = "Other"),
+    Priority                     = fct_lump_min(Priority,
+                                                min = 30, other_level = "Other"),
+    acct.target.industry         = fct_lump_min(acct.target.industry,
+                                                min = 30, other_level = "Other")
+  ) |>
+  droplevels()
+
+# Lumping rare rows on test set so it matches train set
+test_qx <- test_qx |>
+  mutate(
+    acct.manufacturing.model     = fct_other(acct.manufacturing.model,
+                                             keep = levels(train_qx$acct.manufacturing.model)),
+    acct.territory.rollup        = fct_other(acct.territory.rollup,
+                                             keep = levels(train_qx$acct.territory.rollup)),
+    last.tactic.campaign.channel = fct_other(last.tactic.campaign.channel,
+                                             keep = levels(train_qx$last.tactic.campaign.channel)),
+    title_group                  = fct_other(title_group,
+                                             keep = levels(train_qx$title_group)),
+    Priority                     = fct_other(Priority,
+                                             keep = levels(train_qx$Priority)),
+    acct.target.industry         = fct_other(acct.target.industry,
+                                             keep = levels(train_qx$acct.target.industry))
+  ) |>
+  mutate(across(where(is.factor),
+                ~ factor(., levels = levels(train_qx[[cur_column()]]))))  |>
+  droplevels()
+
+
+```
+
+```{r}
+
+# Handling class imbalance
+n_neg2        <- sum(train_qx$success == "No")
+n_pos2        <- sum(train_qx$success == "Yes")
+weight_ratio2 <- round(n_neg2 / n_pos2)
+weights_qx   <- ifelse(train_qx$success == "Yes", weight_ratio2, 1)
+
+```
+
+
+```{r}
+
+# Training logistic regression model on Qx data
+set.seed(123)
+qx_model <- train(
+  success ~ .,
+  data      = train_qx,
+  method    = "glm",
+  family    = "binomial",
+  weights   = weights_qx,
+  metric    = "ROC",
+  trControl = trainControl(
+    method          = "none",
+    classProbs      = TRUE,
+    summaryFunction = twoClassSummary
+  )
+)
+
+summary(qx_model$finalModel)
+
+```
+
+```{r}
+
+# Running test set
+test_probs2 <- predict(qx_model, newdata = test_qx, type = "prob")[, "Yes"]
+test_preds_default2 <- factor(ifelse(test_probs2 > 0.5, "Yes", "No"),
+                             levels = c("No", "Yes"))
+
+# ROC and AUC
+roc_obj2 <- roc(test_qx$success, test_probs2, levels = c("No", "Yes"))
+cat("Test AUC:", round(auc(roc_obj2), 3), "\n")
+
+```
+
+
+
+
+
+
+
